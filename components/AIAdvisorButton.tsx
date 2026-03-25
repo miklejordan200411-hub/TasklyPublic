@@ -1,300 +1,282 @@
 'use client'
-import React, { useState, useEffect, useRef } from 'react'
+import React, { useState, useRef, useEffect } from 'react'
 import { Task, ProjectMember, OptimizationResult } from '@/types'
+
+interface Message {
+  role: 'user' | 'assistant'
+  content: string
+}
 
 interface Props {
   tasks: Task[]
   members: ProjectMember[]
+  projectName?: string
   currentUserId?: string
-  startDate?: string
   optResult?: OptimizationResult | null
+  isManager?: boolean
 }
 
-function getTodayDayIndex(startDate?: string): number {
-  const projectStart = startDate ? new Date(startDate) : new Date()
-  projectStart.setHours(0, 0, 0, 0)
-  const today = new Date()
-  today.setHours(0, 0, 0, 0)
-  return Math.round((today.getTime() - projectStart.getTime()) / 86400000) + 1
-}
-
-function getScheduleMap(optResult: OptimizationResult | null | undefined) {
-  const map = new Map<string, {
-    startDay: number; endDay: number; workerId: string
-    startHour?: number; endHour?: number; workerHpd?: number
-  }>()
-  if (!optResult) return map
-  for (const ws of optResult.schedule) {
-    for (const at of ws.assigned_tasks) {
-      const extra = at as any
-      map.set(at.task_id, {
-        startDay: at.start_day,
-        endDay: at.end_day,
-        workerId: ws.user_id,
-        startHour: typeof extra.start_hour === 'number' ? extra.start_hour : undefined,
-        endHour:   typeof extra.end_hour   === 'number' ? extra.end_hour   : undefined,
-        workerHpd: ws.hours_per_day,
-      })
-    }
-  }
-  return map
-}
-
-const WEEKDAYS = ['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday']
-
-const LOADING_STEPS = [
-  { icon: '🔍', text: 'Analyzing tasks...' },
-  { icon: '📊', text: 'Calculating workload...' },
-  { icon: '🤖', text: 'Generating AI advice...' },
-]
-
-function WorkloadBar({ pct }: { pct: number }) {
-  const clamped = Math.min(100, Math.max(0, pct))
-  const color = clamped >= 90 ? '#ef4444' : clamped >= 70 ? '#f59e0b' : '#6366f1'
-  const bg    = clamped >= 90 ? '#fef2f2' : clamped >= 70 ? '#fffbeb' : '#eef2ff'
-  const label = clamped >= 90 ? 'High load' : clamped >= 70 ? 'Moderate' : 'On track'
-
+function TypingDots() {
   return (
-    <div className="rounded-xl p-4 mb-5" style={{ background: bg, border: `1px solid ${color}22` }}>
-      <div className="flex items-center justify-between mb-2">
-        <span className="text-xs font-semibold text-slate-500 uppercase tracking-wide">Workload today</span>
-        <div className="flex items-center gap-2">
-          <span className="text-xs font-medium px-2 py-0.5 rounded-full" style={{ background: color + '18', color }}>
-            {label}
-          </span>
-          <span className="text-xl font-black" style={{ color }}>{clamped}%</span>
-        </div>
-      </div>
-      <div className="h-2 rounded-full bg-white" style={{ boxShadow: 'inset 0 1px 3px rgba(0,0,0,0.08)' }}>
-        <div
-          className="h-full rounded-full transition-all duration-700"
-          style={{ width: `${clamped}%`, background: color }}
+    <div className="flex items-center gap-1 py-1 px-1">
+      {[0, 1, 2].map(i => (
+        <span
+          key={i}
+          className="w-1.5 h-1.5 rounded-full bg-indigo-400 inline-block"
+          style={{ animation: `chatDot 1.2s ease-in-out ${i * 0.2}s infinite` }}
         />
-      </div>
+      ))}
     </div>
   )
 }
 
-export default function AIAdvisorButton({ tasks, members, currentUserId, startDate, optResult }: Props) {
+const QUICK_QUESTIONS = [
+  'Какие задачи сейчас заблокированы?',
+  'Кто перегружен?',
+  'Какие дедлайны ближайшие?',
+  'Посоветуй с чего начать',
+]
+
+export default function AIChatBot({
+  tasks,
+  members,
+  projectName,
+  currentUserId,
+  optResult,
+  isManager,
+}: Props) {
   const [open, setOpen] = useState(false)
-  const [loadingStep, setLoadingStep] = useState(-1)
-  const [advice, setAdvice] = useState<string | null>(null)
-  const [workloadPct, setWorkloadPct] = useState(0)
-  const [error, setError] = useState<string | null>(null)
-  const stepTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const [messages, setMessages] = useState<Message[]>([
+    {
+      role: 'assistant',
+      content: `Привет! Я AI-ассистент проекта **${projectName || 'Taskly'}**.\n\nЯ знаю все задачи, участников и статусы. Задавай вопросы — отвечу по существу.`,
+    },
+  ])
+  const [input, setInput] = useState('')
+  const [loading, setLoading] = useState(false)
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const inputRef = useRef<HTMLTextAreaElement>(null)
 
-  useEffect(() => () => { if (stepTimerRef.current) clearTimeout(stepTimerRef.current) }, [])
+  useEffect(() => {
+    if (open) {
+      setTimeout(() => bottomRef.current?.scrollIntoView({ behavior: 'smooth' }), 50)
+    }
+  }, [messages, open, loading])
 
-  const member = members.find(m => m.user_id === currentUserId) ?? members[0]
+  useEffect(() => {
+    if (open) setTimeout(() => inputRef.current?.focus(), 100)
+  }, [open])
 
-  function handleOpen() {
-    setOpen(true)
-    setAdvice(null)
-    setError(null)
-    setLoadingStep(0)
-    runAdvisor()
+  function buildContext() {
+    const taskLines = tasks.map(t => {
+      const assignee = members.find(m => m.user_id === t.assigned_to)?.username ?? 'не назначен'
+      const deps = t.depends_on?.length ? ` | depends_on: ${t.depends_on.length} tasks` : ''
+      return `- [${t.status}] "${t.name}" | skill: ${t.skill} | priority: ${t.priority} | duration: ${t.duration}h | assignee: ${assignee}${t.deadline_days != null ? ` | deadline_days: ${t.deadline_days}` : ''}${deps}`
+    }).join('\n') || '(нет задач)'
+
+    const memberLines = members.map(m =>
+      `- ${m.username} (${m.role}) | skills: ${m.skills?.join(', ') || '—'} | hours/day: ${m.hours_per_day}`
+    ).join('\n') || '(нет участников)'
+
+    const optLines = optResult
+      ? optResult.schedule.map(ws =>
+          `- ${ws.username}: ${ws.assigned_tasks.length} tasks, utilization ${ws.utilization_percent}%`
+        ).join('\n')
+      : '(оптимизация не запускалась)'
+
+    const warnings = optResult?.warnings?.length
+      ? optResult.warnings.map(w => `- ${w}`).join('\n')
+      : '(нет предупреждений)'
+
+    return `ПРОЕКТ: ${projectName || 'Taskly'}
+РОЛЬ ТЕКУЩЕГО ПОЛЬЗОВАТЕЛЯ: ${isManager ? 'manager' : 'worker'}
+
+=== ЗАДАЧИ (${tasks.length}) ===
+${taskLines}
+
+=== УЧАСТНИКИ (${members.length}) ===
+${memberLines}
+
+=== РЕЗУЛЬТАТ ОПТИМИЗАЦИИ ===
+${optLines}
+
+=== ПРЕДУПРЕЖДЕНИЯ ОПТИМИЗАЦИИ ===
+${warnings}`
   }
 
-  function handleClose() {
-    setOpen(false)
-    setLoadingStep(-1)
-  }
+  async function send(text?: string) {
+    const trimmed = (text ?? input).trim()
+    if (!trimmed || loading) return
 
-  async function runAdvisor() {
+    const userMsg: Message = { role: 'user', content: trimmed }
+    const newMessages = [...messages, userMsg]
+    setMessages(newMessages)
+    setInput('')
+    setLoading(true)
+
     try {
-      const todayIdx = getTodayDayIndex(startDate)
-      const schedMap = getScheduleMap(optResult)
-      const hpd = Number(member?.hours_per_day) || 8
-
-      const tasksToday = tasks.filter(t => {
-        const s = schedMap.get(t.id)
-        return s && s.workerId === (member?.user_id ?? '') && todayIdx >= s.startDay && todayIdx <= s.endDay
-      })
-
-      const upcomingTasks = tasks.filter(t => {
-        const s = schedMap.get(t.id)
-        return s && s.workerId === (member?.user_id ?? '') && s.startDay > todayIdx && s.startDay <= todayIdx + 3
-      })
-
-      const hoursToday = tasksToday.reduce((sum, t) => {
-        const s = schedMap.get(t.id)
-        if (!s) return sum
-        if (s.startHour !== undefined && s.endHour !== undefined) {
-          const durationH = s.endHour - s.startHour
-          const daysSpan = s.endDay - s.startDay + 1
-          return sum + durationH / daysSpan
-        }
-        return sum + Number(t.duration) / Math.max(1, s.endDay - s.startDay + 1)
-      }, 0)
-
-      const pct = Math.round((hoursToday / hpd) * 100)
-      setWorkloadPct(pct)
-
-      const weekday = WEEKDAYS[new Date().getDay()]
-      const todayStr = new Date().toLocaleDateString('en-US', { year: 'numeric', month: 'long', day: 'numeric' })
-
-      for (let i = 1; i < LOADING_STEPS.length; i++) {
-        await new Promise<void>(res => { stepTimerRef.current = setTimeout(res, 900) })
-        setLoadingStep(i)
-      }
-
-      const res = await fetch('/api/ai/advice', {
+      const res = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          workerName: member?.username ?? 'Worker',
-          today: todayStr,
-          weekday,
-          workloadPct: pct,
-          hoursPerDay: hpd,
-          workerSkills: member?.skills ?? [],
-          tasksToday: tasksToday.map(t => ({
-            name: t.name, skill: t.skill, duration: t.duration,
-            priority: t.priority, deadline_days: t.deadline_days,
-          })),
-          upcomingTasks: upcomingTasks.map(t => {
-            const s = schedMap.get(t.id)
-            return {
-              name: t.name, skill: t.skill, duration: t.duration,
-              priority: t.priority, deadline_days: t.deadline_days,
-              startsInDays: s ? s.startDay - todayIdx : null,
-            }
-          }),
+          messages: newMessages,
+          context: buildContext(),
         }),
       })
 
-      if (!res.ok) throw new Error(await res.text())
+      if (!res.ok) {
+        const err = await res.json()
+        throw new Error(err.error || 'Ошибка сервера')
+      }
+
       const data = await res.json()
-      setAdvice(data.advice)
-      setLoadingStep(-1)
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Something went wrong')
-      setLoadingStep(-1)
+      setMessages([...newMessages, { role: 'assistant', content: data.reply }])
+    } catch (e: any) {
+      setMessages([...newMessages, {
+        role: 'assistant',
+        content: `⚠ ${e.message ?? 'Что-то пошло не так. Попробуй ещё раз.'}`,
+      }])
+    } finally {
+      setLoading(false)
+      setTimeout(() => inputRef.current?.focus(), 50)
     }
   }
 
-  const isLoading = loadingStep >= 0
+  function handleKey(e: React.KeyboardEvent<HTMLTextAreaElement>) {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault()
+      send()
+    }
+  }
+
+  const unread = !open && messages.length > 1
 
   return (
     <>
-      {/* Trigger button — matches btn-secondary style */}
+      {/* Floating button */}
       <button
-        onClick={handleOpen}
-        className="btn-secondary text-sm flex items-center gap-2"
+        onClick={() => setOpen(v => !v)}
+        className="fixed bottom-6 right-6 z-50 w-13 h-13 rounded-2xl bg-indigo-600 hover:bg-indigo-700 text-white shadow-lg flex items-center justify-center text-xl transition-all duration-200 hover:scale-105 active:scale-95"
+        style={{ width: 52, height: 52 }}
+        title="AI Chat"
       >
-        AI Advisor
+        {open ? '✕' : '💬'}
+        {unread && (
+          <span className="absolute -top-1 -right-1 w-3 h-3 bg-red-500 rounded-full border-2 border-white" />
+        )}
       </button>
 
+      {/* Chat window */}
       {open && (
         <div
-          onClick={handleClose}
-          className="fixed inset-0 z-50 flex items-center justify-center p-4"
-          style={{ background: 'rgba(15,23,42,0.4)', backdropFilter: 'blur(2px)' }}
+          className="fixed bottom-20 right-6 z-50 w-80 sm:w-96 bg-white rounded-2xl shadow-2xl border border-slate-200 flex flex-col overflow-hidden"
+          style={{ height: 520, animation: 'chatSlideUp 0.2s cubic-bezier(0.34,1.56,0.64,1)' }}
         >
-          <div
-            onClick={e => e.stopPropagation()}
-            className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden"
-            style={{ animation: 'slideUp 0.2s cubic-bezier(0.34,1.56,0.64,1)' }}
-          >
-            {/* Header */}
-            <div className="flex items-center justify-between px-6 py-4 border-b border-slate-100">
-              <div className="flex items-center gap-3">
-                <div className="w-9 h-9 rounded-xl bg-indigo-50 border border-indigo-100 flex items-center justify-center text-lg">
-                  🧠
-                </div>
-                <div>
-                  <div className="font-semibold text-slate-800 text-sm">AI Advisor — Today</div>
-                  <div className="text-xs text-slate-400">
-                    {member?.username ?? 'Worker'} · {new Date().toLocaleDateString('en-US', { weekday: 'long', month: 'short', day: 'numeric' })}
-                  </div>
+          {/* Header */}
+          <div className="flex items-center gap-3 px-4 py-3 bg-indigo-600 text-white flex-shrink-0">
+            <div className="w-8 h-8 rounded-xl bg-white/20 flex items-center justify-center text-base">🧠</div>
+            <div className="flex-1 min-w-0">
+              <div className="font-semibold text-sm">AI Ассистент</div>
+              <div className="text-xs text-indigo-200 truncate">{projectName}</div>
+            </div>
+            <button
+              onClick={() => setOpen(false)}
+              className="text-white/60 hover:text-white text-lg leading-none transition-colors"
+            >
+              ✕
+            </button>
+          </div>
+
+          {/* Messages */}
+          <div className="flex-1 overflow-y-auto px-3 py-3 space-y-3">
+            {messages.map((msg, i) => (
+              <div
+                key={i}
+                className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}
+                style={{ animation: 'chatFadeIn 0.2s ease' }}
+              >
+                {msg.role === 'assistant' && (
+                  <div className="w-6 h-6 rounded-lg bg-indigo-100 flex items-center justify-center text-xs mr-2 flex-shrink-0 mt-0.5">🧠</div>
+                )}
+                <div
+                  className={`max-w-[78%] px-3 py-2 rounded-2xl text-sm leading-relaxed whitespace-pre-wrap ${
+                    msg.role === 'user'
+                      ? 'bg-indigo-600 text-white rounded-br-sm'
+                      : 'bg-slate-100 text-slate-800 rounded-bl-sm'
+                  }`}
+                >
+                  {msg.content}
                 </div>
               </div>
-              <button
-                onClick={handleClose}
-                className="text-slate-300 hover:text-slate-500 text-xl leading-none transition-colors"
-              >
-                ×
-              </button>
-            </div>
+            ))}
 
-            {/* Body */}
-            <div className="px-6 py-5">
-
-              {/* Workload bar */}
-              {!isLoading && (advice || error) && (
-                <WorkloadBar pct={workloadPct} />
-              )}
-
-              {/* Loading */}
-              {isLoading && (
-                <div className="py-4 space-y-3">
-                  {LOADING_STEPS.map((step, i) => (
-                    <div
-                      key={i}
-                      className="flex items-center gap-3 transition-opacity duration-300"
-                      style={{ opacity: i <= loadingStep ? 1 : 0.3 }}
-                    >
-                      <div className={`w-8 h-8 rounded-lg flex items-center justify-center text-sm border transition-all duration-300 ${
-                        i < loadingStep
-                          ? 'bg-indigo-50 border-indigo-200 text-indigo-600'
-                          : i === loadingStep
-                          ? 'bg-indigo-600 border-indigo-600 text-white'
-                          : 'bg-slate-50 border-slate-200 text-slate-400'
-                      }`}>
-                        {i < loadingStep ? '✓' : step.icon}
-                      </div>
-                      <span className={`text-sm font-medium transition-colors duration-300 ${
-                        i === loadingStep ? 'text-indigo-700' : i < loadingStep ? 'text-slate-400' : 'text-slate-300'
-                      }`}>
-                        {step.text}
-                      </span>
-                      {i === loadingStep && (
-                        <div className="ml-auto flex gap-1">
-                          {[0,1,2].map(d => (
-                            <div key={d} className="w-1.5 h-1.5 rounded-full bg-indigo-400"
-                              style={{ animation: `pulse 1.2s ease-in-out ${d * 0.2}s infinite` }} />
-                          ))}
-                        </div>
-                      )}
-                    </div>
-                  ))}
+            {loading && (
+              <div className="flex justify-start items-center gap-2">
+                <div className="w-6 h-6 rounded-lg bg-indigo-100 flex items-center justify-center text-xs flex-shrink-0">🧠</div>
+                <div className="bg-slate-100 rounded-2xl rounded-bl-sm px-3 py-2">
+                  <TypingDots />
                 </div>
-              )}
-
-              {/* Error */}
-              {error && !isLoading && (
-                <div className="rounded-xl p-4 bg-red-50 border border-red-100 text-red-600 text-sm">
-                  ⚠ {error}
-                </div>
-              )}
-
-              {/* Advice */}
-              {advice && !isLoading && (
-                <div className="text-sm text-slate-700 leading-relaxed whitespace-pre-wrap">
-                  {advice}
-                </div>
-              )}
-            </div>
-
-            {/* Footer */}
-            {!isLoading && (advice || error) && (
-              <div className="px-6 py-3 bg-slate-50 border-t border-slate-100 flex justify-between items-center">
-                <span className="text-xs text-slate-400">Powered by NurdauletEsenbay</span>
-                <button onClick={handleClose} className="btn-secondary text-xs">Close</button>
               </div>
             )}
+            <div ref={bottomRef} />
+          </div>
+
+          {/* Quick questions */}
+          {messages.length <= 1 && (
+            <div className="px-3 pb-2 flex flex-wrap gap-1.5 flex-shrink-0">
+              {QUICK_QUESTIONS.map(q => (
+                <button
+                  key={q}
+                  onClick={() => send(q)}
+                  className="text-xs px-2.5 py-1 rounded-full bg-indigo-50 text-indigo-600 border border-indigo-100 hover:bg-indigo-100 transition-colors"
+                >
+                  {q}
+                </button>
+              ))}
+            </div>
+          )}
+
+          {/* Input */}
+          <div className="flex items-end gap-2 px-3 py-3 border-t border-slate-100 flex-shrink-0">
+            <textarea
+              ref={inputRef}
+              value={input}
+              onChange={e => setInput(e.target.value)}
+              onKeyDown={handleKey}
+              placeholder="Спроси про задачи, участников..."
+              rows={1}
+              disabled={loading}
+              className="flex-1 input text-sm py-2 resize-none min-h-[36px] max-h-[100px]"
+              style={{ lineHeight: 1.5 }}
+              onInput={e => {
+                const el = e.currentTarget
+                el.style.height = 'auto'
+                el.style.height = Math.min(el.scrollHeight, 100) + 'px'
+              }}
+            />
+            <button
+              onClick={() => send()}
+              disabled={!input.trim() || loading}
+              className="btn-primary px-3 py-2 text-sm flex-shrink-0 disabled:opacity-40"
+            >
+              ↑
+            </button>
           </div>
         </div>
       )}
 
       <style>{`
-        @keyframes slideUp {
-          from { opacity: 0; transform: translateY(16px) scale(0.98) }
+        @keyframes chatSlideUp {
+          from { opacity: 0; transform: translateY(12px) scale(0.97) }
           to   { opacity: 1; transform: translateY(0) scale(1) }
         }
-        @keyframes pulse {
-          0%, 100% { opacity: 0.3; transform: scale(0.8) }
-          50% { opacity: 1; transform: scale(1.2) }
+        @keyframes chatFadeIn {
+          from { opacity: 0; transform: translateY(4px) }
+          to   { opacity: 1; transform: translateY(0) }
+        }
+        @keyframes chatDot {
+          0%, 80%, 100% { transform: scale(0.7); opacity: 0.4 }
+          40% { transform: scale(1.2); opacity: 1 }
         }
       `}</style>
     </>

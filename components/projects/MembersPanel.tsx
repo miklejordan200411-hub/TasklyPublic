@@ -1,5 +1,5 @@
 'use client'
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import { ProjectMember, Task } from '@/types'
 
 interface Props {
@@ -16,10 +16,16 @@ export default function MembersPanel({ members, tasks, isManager, projectId, onC
   const [skillsInput, setSkillsInput] = useState('')
   const [hoursInput, setHoursInput] = useState('')
 
+  // CV upload state
+  const [cvLoading, setCvLoading] = useState(false)
+  const [cvError, setCvError] = useState<string | null>(null)
+  const fileInputRef = useRef<HTMLInputElement>(null)
+
   function startEdit(m: ProjectMember) {
     setEditing(m.user_id)
     setSkillsInput(m.skills.join(', '))
     setHoursInput(m.hours_per_day.toString())
+    setCvError(null)
   }
 
   async function saveEdit(userId: string) {
@@ -34,6 +40,48 @@ export default function MembersPanel({ members, tasks, isManager, projectId, onC
     })
     setEditing(null)
     onReload()
+  }
+
+  async function handleCvUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0]
+    if (!file) return
+
+    setCvLoading(true)
+    setCvError(null)
+
+    try {
+      const formData = new FormData()
+      formData.append('cv', file)
+
+      const res = await fetch(`/api/projects/${projectId}/members/cv`, {
+        method: 'POST',
+        body: formData,
+      })
+
+      const data = await res.json()
+
+      if (!res.ok) {
+        setCvError(data.error ?? 'Something went wrong')
+        return
+      }
+
+      const extracted: string[] = data.skills ?? []
+      if (extracted.length === 0) {
+        setCvError('No skills found in the CV')
+        return
+      }
+
+      // Merge with existing skills, deduplicate
+      const existing = skillsInput.split(',').map(s => s.trim()).filter(Boolean)
+      const merged = Array.from(new Set([...existing, ...extracted]))
+      setSkillsInput(merged.join(', '))
+    } catch {
+      setCvError('Failed to upload CV')
+    } finally {
+      setCvLoading(false)
+      // Reset so same file can be re-uploaded
+      if (fileInputRef.current) fileInputRef.current.value = ''
+    }
   }
 
   return (
@@ -67,6 +115,51 @@ export default function MembersPanel({ members, tasks, isManager, projectId, onC
 
               {editing === m.user_id ? (
                 <div className="space-y-2 mt-2">
+
+                  {/* ── CV Upload ─────────────────────────────── */}
+                  <div>
+                    <label className="text-xs text-slate-500 block mb-1">Auto-detect skills from CV</label>
+                    <div className="flex items-center gap-2">
+                      <button
+                        type="button"
+                        disabled={cvLoading}
+                        onClick={() => fileInputRef.current?.click()}
+                        className="btn-secondary text-xs py-1 flex items-center gap-1.5 disabled:opacity-50"
+                      >
+                        {cvLoading ? (
+                          <>
+                            <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
+                              <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                              <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8v8z" />
+                            </svg>
+                            Analysing…
+                          </>
+                        ) : (
+                          <>
+                            <svg className="h-3 w-3" viewBox="0 0 20 20" fill="currentColor">
+                              <path d="M3 17a1 1 0 011-1h12a1 1 0 110 2H4a1 1 0 01-1-1zM6.293 6.707a1 1 0 010-1.414l3-3a1 1 0 011.414 0l3 3a1 1 0 01-1.414 1.414L11 5.414V13a1 1 0 11-2 0V5.414L7.707 6.707a1 1 0 01-1.414 0z" />
+                            </svg>
+                            Upload CV
+                          </>
+                        )}
+                      </button>
+                      <span className="text-xs text-slate-400">PDF or TXT</span>
+                    </div>
+
+                    <input
+                      ref={fileInputRef}
+                      type="file"
+                      accept=".pdf,.txt"
+                      className="hidden"
+                      onChange={handleCvUpload}
+                    />
+
+                    {cvError && (
+                      <p className="text-xs text-red-500 mt-1">{cvError}</p>
+                    )}
+                  </div>
+
+                  {/* ── Skills ────────────────────────────────── */}
                   <div>
                     <label className="text-xs text-slate-500 block mb-1">Skills (comma-separated)</label>
                     <input
@@ -76,6 +169,8 @@ export default function MembersPanel({ members, tasks, isManager, projectId, onC
                       placeholder="React, Node, Python"
                     />
                   </div>
+
+                  {/* ── Hours ─────────────────────────────────── */}
                   <div>
                     <label className="text-xs text-slate-500 block mb-1">Hours per day</label>
                     <input
@@ -87,6 +182,7 @@ export default function MembersPanel({ members, tasks, isManager, projectId, onC
                       max="24"
                     />
                   </div>
+
                   <div className="flex gap-2">
                     <button onClick={() => saveEdit(m.user_id)} className="btn-primary text-xs py-1">Save</button>
                     <button onClick={() => setEditing(null)} className="btn-secondary text-xs py-1">Cancel</button>

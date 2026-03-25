@@ -7,7 +7,12 @@ const SECRET = new TextEncoder().encode(
   process.env.JWT_SECRET || 'taskly-dev-secret-change-in-production'
 )
 const COOKIE = 'taskly_token'
-
+// Add this to your lib/auth.ts
+export async function verifyAuth(req?: Request): Promise<JWTPayload | null> {
+  // We use getSession which already looks at the cookies
+  const session = await getSession()
+  return session
+}
 export async function hashPassword(password: string): Promise<string> {
   return bcrypt.hash(password, 12)
 }

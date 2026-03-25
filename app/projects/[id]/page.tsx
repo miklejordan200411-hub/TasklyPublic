@@ -8,6 +8,7 @@ import GanttView from '@/components/gantt/GanttView'
 import TableView from '@/components/tasks/TableView'
 import TaskModal from '@/components/tasks/TaskModal'
 import MembersPanel from '@/components/projects/MembersPanel'
+import AIAdvisorButton from '@/components/AIAdvisorButton'
 type ViewMode = 'table' | 'kanban' | 'gantt'
 
 export default function ProjectPage() {
@@ -119,8 +120,14 @@ export default function ProjectPage() {
               </span>
             )}
           </div>
-          <div className="flex gap-2">
-            
+            <div className="flex gap-2">
+            <AIAdvisorButton
+              tasks={tasks}
+              members={members}
+              currentUserId={loggedInUserId ?? undefined}
+              startDate={project?.start_date}
+              optResult={optResult}
+            />
             <button onClick={() => setShowMembers(v => !v)} className="btn-secondary text-sm">
                Members ({members.length})
             </button>

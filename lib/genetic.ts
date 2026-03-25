@@ -33,8 +33,8 @@ const CROSSOVER_RATE = 0.75
 
 const PENALTY = {
   DEPENDENCY_VIOLATED: -1000,  // жёсткое ограничение — нарушать нельзя никогда
-  WRONG_SKILL: -250,           // навык критичен для качества работы
-  CRITICAL_LATE: -150,         // приоритет 5 просрочен — катастрофа
+  WRONG_SKILL: -150,           // навык критичен для качества работы
+  CRITICAL_LATE: -300,         // приоритет 5 просрочен — катастрофа
   DEADLINE_MISS_PER_DAY: -50,  // каждый день просрочки дорого стоит
   OVERWORK: -40,               // перегруз снижает качество
   OVERWORK_SEVERE: -100,       // >125% hpd — недопустимо
@@ -72,7 +72,16 @@ function topoSort(tasks: Task[], depMap: Map<string, string[]>): Task[] {
     if (t) result.push(t)
   }
 
-  const prioritised = [...tasks].sort((a, b) => b.priority - a.priority)
+  const prioritised = [...tasks].sort((a, b) => {
+    // Primary: higher priority first
+    if (b.priority !== a.priority) return b.priority - a.priority
+    // Tiebreaker: earlier deadline first — so Task B (deadline=1) is scheduled
+    // before Task A (deadline=4) when both sit on the same worker, preventing
+    // an avoidable miss caused purely by arbitrary ordering
+    const aD = a.deadline_days ?? Infinity
+    const bD = b.deadline_days ?? Infinity
+    return aD - bD
+  })
   for (const t of prioritised) visit(t.id)
   return result
 }
@@ -155,6 +164,39 @@ function buildSchedule(
   return buildScheduleHours(assignments, tasks, workers, depMap)
 }
 
+// Earliest a task can possibly finish given its dependency chain and assigned worker's hpd.
+// Used to distinguish "unavoidable" deadline misses (caused by dep chain) from avoidable ones.
+function computeMinEndDays(
+  tasks: Task[],
+  workers: ProjectMember[],
+  assignments: number[],
+  depMap: Map<string, string[]>
+): Map<string, number> {
+  const taskIndexMap = new Map(tasks.map((t, i) => [t.id, i]))
+  const minEndDay = new Map<string, number>()
+
+  for (const task of topoSort(tasks, depMap)) {
+    const taskIdx = taskIndexMap.get(task.id)
+    if (taskIdx === undefined) continue
+
+    const workerIdx = assignments[taskIdx]
+    const worker = (workerIdx >= 0 && workerIdx < workers.length) ? workers[workerIdx] : null
+    const hpd = worker ? Math.max(1, Number(worker.hours_per_day) || 8) : 8
+    const duration = Math.max(0.5, Number(task.duration))
+    const ownDays = Math.ceil(duration / hpd)
+
+    // Earliest start = when all dependencies finish
+    let depLatestEnd = 0
+    for (const depId of depMap.get(task.id) ?? []) {
+      depLatestEnd = Math.max(depLatestEnd, minEndDay.get(depId) ?? 0)
+    }
+
+    minEndDay.set(task.id, depLatestEnd + ownDays)
+  }
+
+  return minEndDay
+}
+
 function evaluate(
   individual: Individual,
   tasks: Task[],
@@ -166,6 +208,7 @@ function evaluate(
   const schedMap = new Map(schedule.map(s => [s.taskId, s]))
   const taskMap = new Map(tasks.map(t => [t.id, t]))
   const workerMap = new Map(workers.map(w => [w.user_id, w]))
+  const minEndDays = computeMinEndDays(tasks, workers, individual.assignments, depMap)
 
   // ── Назначение ───────────────────────────────────────────
   for (let i = 0; i < tasks.length; i++) {
@@ -193,11 +236,19 @@ function evaluate(
     if (!task || task.deadline_days == null) continue
 
     if (s.endDay > task.deadline_days) {
-      const daysLate = s.endDay - task.deadline_days
-      score += PENALTY.DEADLINE_MISS_PER_DAY * daysLate
-      if (task.priority === 5) score += PENALTY.CRITICAL_LATE
-      // Чем выше приоритет — тем дороже просрочка
-      score += PENALTY.DEADLINE_MISS_PER_DAY * daysLate * (task.priority - 1) * 0.5
+      const minEnd = minEndDays.get(s.taskId) ?? 0
+      // Only penalise the part the GA could actually have prevented.
+      // If the dependency chain alone pushes the task past its deadline,
+      // that is structurally unavoidable — penalising it just wastes
+      // evolution budget and makes the algorithm worse on other factors.
+      const avoidableLate = Math.max(0, s.endDay - Math.max(task.deadline_days, minEnd))
+
+      if (avoidableLate > 0) {
+        score += PENALTY.DEADLINE_MISS_PER_DAY * avoidableLate
+        if (task.priority === 5) score += PENALTY.CRITICAL_LATE
+        score += PENALTY.DEADLINE_MISS_PER_DAY * avoidableLate * (task.priority - 1) * 0.5
+      }
+      // avoidableLate === 0 means the miss is 100% caused by dependencies → no penalty
     } else {
       const daysEarly = task.deadline_days - s.endDay
       score += BONUS.DEADLINE_EARLY * Math.min(daysEarly, 5)
@@ -431,11 +482,21 @@ export function runGeneticOptimization(input: EvaluationInput): OptimizationResu
       warnings.push(`${ws.username} has no tasks assigned`)
   }
 
+  // Compute minEndDays for final schedule to generate accurate warnings
+  const minEndDaysFinal = computeMinEndDays(tasks, workers, best.assignments, depMap)
+
   for (const s of schedule) {
     const task = taskMapFinal.get(s.taskId)
-    if (task?.deadline_days != null && s.endDay > task.deadline_days) {
+    if (task?.deadline_days == null) continue
+    if (s.endDay > task.deadline_days) {
+      const minEnd = minEndDaysFinal.get(s.taskId) ?? 0
+      const unavoidable = minEnd > task.deadline_days
       const d = s.endDay - task.deadline_days
-      warnings.push(`"${task.name}" misses deadline by ${d} day${d !== 1 ? 's' : ''}`)
+      if (unavoidable) {
+        warnings.push(`"${task.name}" deadline is impossible — dependency chain requires at least ${minEnd} day${minEnd !== 1 ? 's' : ''}, but deadline is day ${task.deadline_days}`)
+      } else {
+        warnings.push(`"${task.name}" misses deadline by ${d} day${d !== 1 ? 's' : ''}`)
+      }
     }
   }
 
